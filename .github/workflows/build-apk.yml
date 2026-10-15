@@ -8,17 +8,190 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - name: Accept Android licenses
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+
+      - name: Apply fixes to project code
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re, pathlib
+
+          J = pathlib.Path('app/src/main/java/com/openjarvis')
+
+          def edit(path, fn):
+              p = pathlib.Path(path)
+              s = p.read_text(encoding='utf-8')
+              n = fn(s)
+              print(('CHANGED  ' if n != s else 'NO CHANGE ') + str(path))
+              p.write_text(n, encoding='utf-8')
+
+          # 1. gradle.properties
+          pathlib.Path('gradle.properties').write_text('android.useAndroidX=true\norg.gradle.jvmargs=-Xmx3g\n')
+
+          # 2. app/build.gradle: compose compiler version + newer Compose BOM + Material lib
+          def f(s):
+              s = s.replace("kotlinCompilerExtensionVersion '1.5.5'", "kotlinCompilerExtensionVersion '1.5.4'")
+              s = s.replace("compose-bom:2023.10.01", "compose-bom:2024.02.00")
+              if 'com.google.android.material:material' not in s:
+                  s = s.replace("    implementation 'androidx.compose.material3:material3'\n",
+                                "    implementation 'androidx.compose.material3:material3'\n    implementation 'com.google.android.material:material:1.11.0'\n")
+              return s
+          edit('app/build.gradle', f)
+
+          # 3. Manifest: MainActivity lives in the ui package
+          edit('app/src/main/AndroidManifest.xml', lambda s: s.replace('".MainActivity"', '".ui.MainActivity"'))
+
+          # 4. AgentCore: missing brace, bad label, wrong named argument
+          def f(s):
+              s = s.replace('return@taskMutex.withLock', 'return@withLock')
+              s = s.replace('cleanCommand = cleanCommand,', 'command = cleanCommand,')
+              old = 'graphifyRepo.logTask(cleanCommand, "failed: ${e.message}", "", 0)\n            }\n        }\n    }\n'
+              assert old in s, 'AgentCore anchor not found'
+              s = s.replace(old, old + '    }\n')
+              return s
+          edit(J / 'agent/AgentCore.kt', f)
+
+          # 5. MCPClient: invalid OkHttp RequestBody construction
+          def f(s):
+              s = re.sub(r'\.post\(okhttp3\.RequestBody\.create\(\s*"application/json"\.toByteArray\(\)\.to okhttp3\.MediaType\.get\("application/json"\),\s*requestBody\s*\)\)',
+                         '.post(requestBody.toRequestBody("application/json".toMediaType()))', s)
+              s = s.replace('import okhttp3.Request\n', 'import okhttp3.Request\nimport okhttp3.MediaType.Companion.toMediaType\nimport okhttp3.RequestBody.Companion.toRequestBody\n', 1)
+              return s
+          edit(J / 'mcp/MCPClient.kt', f)
+
+          # 6. TaskNodeDao: query ignored its "command" parameter
+          edit(J / 'graphify/nodes/TaskNodeDao.kt', lambda s: s.replace(
+              '@Query("SELECT * FROM task_nodes ORDER BY timestamp DESC LIMIT :limit")\n    suspend fun getTasksByCommand',
+              '@Query("SELECT * FROM task_nodes WHERE command = :command ORDER BY timestamp DESC LIMIT :limit")\n    suspend fun getTasksByCommand'))
+
+          # 7. ActionExecutor: import of a class that does not exist
+          edit(J / 'accessibility/ActionExecutor.kt', lambda s: s.replace('import com.openjarvis.agent.ActionPlan\n', ''))
+
+          # 8. ProviderFallbackChain: missing import
+          edit(J / 'agent/ProviderFallbackChain.kt', lambda s: s.replace(
+              'import kotlinx.coroutines.flow.MutableStateFlow\n',
+              'import kotlinx.coroutines.flow.MutableStateFlow\nimport org.json.JSONException\n', 1) if 'import org.json.JSONException' not in s else s)
+
+          # 9. AutomationDB: Room DAO must use the @Entity class, with an adapter to the model
+          def f(s):
+              s = s.replace('suspend fun getAll(): List<AutomationManager.Automation>', 'suspend fun getAll(): List<AutomationEntity>')
+              s = s.replace('suspend fun getById(id: String): AutomationManager.Automation?', 'suspend fun getById(id: String): AutomationEntity?')
+              s = s.replace('suspend fun insert(automation: AutomationManager.Automation)', 'suspend fun insert(automation: AutomationEntity)')
+              s = s.replace('suspend fun update(automation: AutomationManager.Automation)', 'suspend fun update(automation: AutomationEntity)')
+              s = s.replace('@Database(entities = [AutomationEntity::class], version = 1)', '@Database(entities = [AutomationEntity::class], version = 1, exportSchema = false)')
+              s = s.replace('val dao = db.automationDao()', 'val dao = AutomationDaoAdapter(db.automationDao())')
+              s += '''
+
+          class AutomationDaoAdapter(private val dao: AutomationDao) {
+              suspend fun getAll(): List<AutomationManager.Automation> = dao.getAll().map { it.toModel() }
+              suspend fun getById(id: String): AutomationManager.Automation? = dao.getById(id)?.toModel()
+              suspend fun insert(automation: AutomationManager.Automation) = dao.insert(automation.toEntity())
+              suspend fun update(automation: AutomationManager.Automation) = dao.update(automation.toEntity())
+              suspend fun delete(id: String) = dao.delete(id)
+          }
+
+          fun AutomationEntity.toModel(): AutomationManager.Automation {
+              val sched: AutomationManager.AutomationSchedule = when (scheduleType) {
+                  "daily" -> AutomationManager.AutomationSchedule.Daily(scheduleHour, scheduleMinute)
+                  "weekly" -> AutomationManager.AutomationSchedule.Weekly(scheduleDayOfWeek, scheduleHour, scheduleMinute)
+                  "once" -> AutomationManager.AutomationSchedule.Once(scheduleIntervalMs)
+                  else -> AutomationManager.AutomationSchedule.Interval(scheduleIntervalMs)
+              }
+              return AutomationManager.Automation(id, name, command, sched, enabled, lastRun, lastResult, runCount)
+          }
+
+          fun AutomationManager.Automation.toEntity(): AutomationEntity {
+              var type = "interval"; var h = 0; var m = 0; var d = 0; var ms = 0L
+              when (val s = schedule) {
+                  is AutomationManager.AutomationSchedule.Daily -> { type = "daily"; h = s.hour; m = s.minute }
+                  is AutomationManager.AutomationSchedule.Weekly -> { type = "weekly"; d = s.dayOfWeek; h = s.hour; m = s.minute }
+                  is AutomationManager.AutomationSchedule.Interval -> { type = "interval"; ms = s.intervalMs }
+                  is AutomationManager.AutomationSchedule.Once -> { type = "once"; ms = s.atMs }
+              }
+              return AutomationEntity(id, name, command, type, h, m, d, ms, enabled, lastRun, lastResult, runCount)
+          }
+          '''
+              return s
+          edit(J / 'automation/AutomationDB.kt', f)
+          edit(J / 'automation/AutomationManager.kt', lambda s: s.replace('private val dao = db.automationDao()', 'private val dao = AutomationDaoAdapter(db.automationDao())'))
+
+          # 10. Missing ui/theme package (never committed upstream)
+          t = J / 'ui/theme'
+          t.mkdir(parents=True, exist_ok=True)
+          (t / 'Theme.kt').write_text('''package com.openjarvis.ui.theme
+
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Color
+
+          object VoidColor {
+              val Void950 = Color(0xFF05050A)
+              val Void900 = Color(0xFF0A0A12)
+              val Void800 = Color(0xFF12121C)
+              val Void700 = Color(0xFF1A1A28)
+              val Void600 = Color(0xFF242436)
+              val Violet = Color(0xFF8B5CF6)
+              val VioletDim = Color(0xFF5B3FA8)
+              val Cyan = Color(0xFF22D3EE)
+              val Green = Color(0xFF34D399)
+              val Red = Color(0xFFF87171)
+              val Amber = Color(0xFFFBBF24)
+              val TextPrimary = Color(0xFFF1F1F8)
+              val TextSecondary = Color(0xFFA1A1B5)
+              val TextDisabled = Color(0xFF5C5C72)
+              val BorderSubtle = Color(0xFF2A2A3C)
+              val BorderGlow = Color(0xFF6D4AD8)
+          }
+
+          @Composable
+          fun OpenJarvisTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = VoidColor.Violet,
+                      secondary = VoidColor.Cyan,
+                      background = VoidColor.Void900,
+                      surface = VoidColor.Void800,
+                      error = VoidColor.Red,
+                      onPrimary = VoidColor.TextPrimary,
+                      onSecondary = VoidColor.Void900,
+                      onBackground = VoidColor.TextPrimary,
+                      onSurface = VoidColor.TextPrimary,
+                      onError = VoidColor.TextPrimary
+                  ),
+                  content = content
+              )
+          }
+          ''')
+          print('CREATED  ui/theme/Theme.kt')
+          PY
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.5'
+
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        shell: bash
+        run: gradle assembleDebug --no-daemon 2>&1 | tee build.log
+
+      - name: Show errors in summary
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo '## Errores de compilacion'
+            echo '```'
+            grep -E '^(e: |.*error:)' build.log | sed 's#file:///home/runner/work/[^/]*/[^/]*/app/src/main/java/com/openjarvis/##' | cut -c1-220 | head -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         with:
           name: OpenJarvis-debug-apk
